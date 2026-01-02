@@ -2,7 +2,7 @@ import os
 import json
 import difflib
 import threading
-from typing import Optional, Dict, List, Any
+from typing import Optional, Dict, List, Any, Tuple
 
 import requests
 import openai
@@ -12,13 +12,14 @@ from pydantic import BaseModel, Field
 
 import time
 import uuid
+import re
 
 # =====================================================
 # ENV
 # =====================================================
 load_dotenv()
-COURSE_API_BASE_URL = os.getenv("COURSE_API_BASE_URL", "http://localhost:8080")   # Spring API (docker internal)
-COURSE_WEB_BASE_URL = os.getenv("COURSE_WEB_BASE_URL", "http://localhost:8080")   # user-facing web link
+COURSE_API_BASE_URL = os.getenv("COURSE_API_BASE_URL", "http://localhost:8080")
+COURSE_WEB_BASE_URL = os.getenv("COURSE_WEB_BASE_URL", "http://localhost:8080")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 client = openai.OpenAI()
@@ -34,12 +35,11 @@ app = FastAPI(title="LearnIT Chat Agent", version="1.0.0")
 SESSIONS: Dict[str, List[dict]] = {}
 SESSIONS_LOCK = threading.Lock()
 
-# session별 last_query 상태 (인메모리)
 SESSION_STATE: Dict[str, dict] = {}
 STATE_LOCK = threading.Lock()
 
 # =====================================================
-# Prompt
+# Prompt (일단 유지 - 다만 실서비스면 CTA 규칙은 빼는 걸 권장)
 # =====================================================
 SYSTEM_PROMPT = {
     "type": "message",
@@ -59,9 +59,9 @@ SYSTEM_PROMPT = {
                 "문장에 '최신'과 '인기'가 동시에 있으면 하나만 선택해서 호출하라. 기본 우선순위는 인기(popular)이다. "
                 "툴 호출 없이 추측 금지. "
                 "응답에 이미지 마크다운(![...](...))을 절대 포함하지 마라. "
-                "항상 각 강의마다 detailUrl(상세페이지 링크)을 함께 안내하라. "
-                "추천 목록 끝에는 각 강의별로 '바로 보기: {detailUrl}' 형태로 CTA를 붙여라. "
-                "사용자가 '원본', 'raw', '디버그'라고 하면 debug_popular_raw를 호출해 원본 JSON을 보여줘라."
+                "사용자가 '원본', 'raw', '디버그'라고 하면 debug_popular_raw를 호출해 원본 JSON을 보여줘라. "
+                "중요: 사용자가 특정 강의 1개를 묻는 경우(예: '#51', '51번 강의')에는 "
+                "가능하면 search_courses로 해당 강의를 찾아 1개만 보여주고 그 강의 설명을 해라."
             )
         }
     ]
@@ -124,6 +124,66 @@ def _get_arguments(x): return _get_field(x, "arguments", None)
 def _get_call_id(x): return _get_field(x, "call_id", None)
 
 # =====================================================
+# ✅ 장문 reply 개행 정리 (items 없을 때만)
+# =====================================================
+def prettify_multiline_reply(text: str) -> str:
+    if not text:
+        return text
+    t = text.strip()
+    t = t.replace("강의에 대해 알려드릴게요.", "강의에 대해 알려드릴게요.\n")
+    t = t.replace("### 강의 정보", "\n강의 정보\n")
+    t = t.replace("- **제목**:", "\n- 제목:")
+    t = t.replace("- **설명**:", "\n- 설명:")
+    t = t.replace("- **가격**:", "\n- 가격:")
+    t = t.replace("- **상태**:", "\n- 상태:")
+    t = t.replace("- **링크**:", "\n- 바로 보기:")
+    t = t.replace("궁금한 점이 더 있으시면", "\n\n궁금한 점이 더 있으시면")
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    return t.strip()
+
+# =====================================================
+# ✅ "#10", "10번" 넘버를 검색 힌트로 분리
+# =====================================================
+def normalize_search_keyword(text: str) -> Tuple[str, Optional[int]]:
+    if not text:
+        return "", None
+    m = re.search(r"#\s*(\d+)|(\d+)\s*번", text)
+    number = None
+    if m:
+        number = int(m.group(1) or m.group(2))
+    keyword = re.sub(r"#\s*\d+|\d+\s*번", "", text).strip()
+    return keyword, number
+
+def match_item_by_hint(all_items: List[dict], hint_no: int) -> Optional[dict]:
+    """
+    ✅ 핵심: 전체 결과(all_items)에서 #n(또는 샘플 강의 n)을 먼저 찾아 1개로 확정
+    """
+    if not all_items or not hint_no:
+        return None
+
+    hn = str(hint_no)
+
+    # 1) title에 '#10'
+    for it in all_items:
+        title = str(it.get("title", ""))
+        if f"#{hn}" in title:
+            return it
+
+    # 2) title에 '샘플 강의 10' 같은 패턴
+    for it in all_items:
+        title = str(it.get("title", ""))
+        if f"샘플 강의 {hn}" in title:
+            return it
+
+    # 3) 마지막 fallback: 숫자 포함 (오탐 가능성 있음)
+    for it in all_items:
+        title = str(it.get("title", ""))
+        if hn in title:
+            return it
+
+    return None
+
+# =====================================================
 # Session helpers
 # =====================================================
 def get_or_create_messages(session_id: str) -> List[dict]:
@@ -181,22 +241,12 @@ def fetch_courses(sort: str, tab: str = "all", page: int = 0, size: int = 12, ca
 
     r = requests.get(url, params=params, timeout=10, allow_redirects=True)
     if not r.ok:
-        return {
-            "error": "COURSE_API_REQUEST_FAILED",
-            "status": r.status_code,
-            "url": r.url,
-            "body": sanitize_text(r.text[:1000]),
-        }
+        return {"error": "COURSE_API_REQUEST_FAILED", "status": r.status_code, "url": r.url, "body": sanitize_text(r.text[:1000])}
 
     try:
         raw = r.json()
     except Exception as je:
-        return {
-            "error": "COURSE_API_NON_JSON_RESPONSE",
-            "detail": sanitize_text(str(je)),
-            "url": r.url,
-            "content_type": r.headers.get("Content-Type"),
-        }
+        return {"error": "COURSE_API_NON_JSON_RESPONSE", "detail": sanitize_text(str(je)), "url": r.url, "content_type": r.headers.get("Content-Type")}
 
     data = normalize_page(raw)
     data["items"] = attach_detail_urls(data.get("items", []))
@@ -228,37 +278,55 @@ def get_latest_courses_by_category(categoryId: int, tab: str = "all", page: int 
         return {"error": "INVALID_CATEGORY_ID"}
     return fetch_courses("latest", tab, page, size, categoryId)
 
+# =====================================================
+# ✅ FIX 핵심: hintNo가 있으면 "전체 결과"에서 먼저 #n을 찾아 1개로 반환
+# =====================================================
 def search_courses(keyword: str, page: int = 0, size: int = 12):
     if page is None or page < 0: page = 0
     if size is None or size <= 0 or size > 50: size = 12
 
+    cleaned_keyword, hint_no = normalize_search_keyword(keyword)
+
     url = f"{COURSE_API_BASE_URL}/api/search/courses"
-    params = {"keyword": keyword, "page": page, "size": size}
+    params = {"keyword": cleaned_keyword, "page": page, "size": size}
 
     r = requests.get(url, params=params, timeout=10, allow_redirects=True)
     if not r.ok:
-        return {
-            "error": "SEARCH_API_FAILED",
-            "status": r.status_code,
-            "url": r.url,
-            "body": sanitize_text(r.text[:1000]),
-        }
+        return {"error": "SEARCH_API_FAILED", "status": r.status_code, "url": r.url, "body": sanitize_text(r.text[:1000])}
 
     try:
         data = r.json()
     except Exception as je:
-        return {
-            "error": "SEARCH_API_NON_JSON_RESPONSE",
-            "detail": sanitize_text(str(je)),
-            "url": r.url,
-            "content_type": r.headers.get("Content-Type"),
-        }
+        return {"error": "SEARCH_API_NON_JSON_RESPONSE", "detail": sanitize_text(str(je)), "url": r.url, "content_type": r.headers.get("Content-Type")}
 
     all_items = data if isinstance(data, list) else []
+
+    # ✅ (중요) #10 같은 요청이면 전체에서 먼저 찾아서 1개만 반환
+    if isinstance(hint_no, int) and hint_no > 0:
+        matched = match_item_by_hint(all_items, hint_no)
+        if matched:
+            one = attach_detail_urls([matched])
+            return {
+                "items": one,
+                "page": 0,
+                "size": 1,
+                "total": len(all_items),
+                "hintNo": hint_no,
+                "cleanedKeyword": cleaned_keyword,
+            }
+
+    # ✅ 못 찾으면 기존처럼 페이징
     start = page * size
     end = start + size
     items = attach_detail_urls(all_items[start:end])
-    return {"items": items, "page": page, "size": size, "total": len(all_items)}
+    return {
+        "items": items,
+        "page": page,
+        "size": size,
+        "total": len(all_items),
+        "hintNo": hint_no,
+        "cleanedKeyword": cleaned_keyword,
+    }
 
 def debug_popular_raw(page: int = 0, size: int = 12):
     return fetch_courses("popular", "all", page, size, None)
@@ -274,58 +342,33 @@ FUNCTION_MAP = {
     "get_latest_courses_by_category": get_latest_courses_by_category,
     "search_courses": search_courses,
     "debug_popular_raw": debug_popular_raw,
-    # get_next_page는 session별 state 필요
 }
 
 TOOLS = [
-    {
-        "type": "function",
-        "name": "resolve_category_id",
-        "description": "카테고리 이름을 받아 categoryId로 매핑한다.",
-        "parameters": {"type": "object", "properties": {"categoryName": {"type": "string"}}, "required": ["categoryName"]},
-    },
-    {
-        "type": "function",
-        "name": "get_popular_courses",
-        "description": "🔥 인기 강의 목록(전체)을 가져온다.",
-        "parameters": {"type": "object", "properties": {"tab": {"type": "string"}, "page": {"type": "integer"}, "size": {"type": "integer"}}, "required": []},
-    },
-    {
-        "type": "function",
-        "name": "get_latest_courses",
-        "description": "🆕 신규 강의 목록(전체)을 가져온다.",
-        "parameters": {"type": "object", "properties": {"tab": {"type": "string"}, "page": {"type": "integer"}, "size": {"type": "integer"}}, "required": []},
-    },
-    {
-        "type": "function",
-        "name": "get_popular_courses_by_category",
-        "description": "🔥 인기 강의(카테고리)를 가져온다. categoryId는 resolve_category_id 결과만 사용.",
-        "parameters": {"type": "object", "properties": {"categoryId": {"type": "integer"}, "tab": {"type": "string"}, "page": {"type": "integer"}, "size": {"type": "integer"}}, "required": ["categoryId"]},
-    },
-    {
-        "type": "function",
-        "name": "get_latest_courses_by_category",
-        "description": "🆕 신규 강의(카테고리)를 가져온다. categoryId는 resolve_category_id 결과만 사용.",
-        "parameters": {"type": "object", "properties": {"categoryId": {"type": "integer"}, "tab": {"type": "string"}, "page": {"type": "integer"}, "size": {"type": "integer"}}, "required": ["categoryId"]},
-    },
-    {
-        "type": "function",
-        "name": "search_courses",
-        "description": "🔎 검색어로 강의를 검색한다.",
-        "parameters": {"type": "object", "properties": {"keyword": {"type": "string"}, "page": {"type": "integer"}, "size": {"type": "integer"}}, "required": ["keyword"]},
-    },
-    {
-        "type": "function",
-        "name": "get_next_page",
-        "description": "더보기/다음: 직전 요청이 검색이면 검색 다음 페이지, 아니면 목록 다음 페이지를 가져온다.",
-        "parameters": {"type": "object", "properties": {}, "required": []},
-    },
-    {
-        "type": "function",
-        "name": "debug_popular_raw",
-        "description": "디버그: 인기 강의 API 원본 JSON(정규화 포함)을 그대로 반환한다.",
-        "parameters": {"type": "object", "properties": {"page": {"type": "integer"}, "size": {"type": "integer"}}, "required": []},
-    },
+    {"type": "function", "name": "resolve_category_id",
+     "description": "카테고리 이름을 받아 categoryId로 매핑한다.",
+     "parameters": {"type": "object", "properties": {"categoryName": {"type": "string"}}, "required": ["categoryName"]}},
+    {"type": "function", "name": "get_popular_courses",
+     "description": "🔥 인기 강의 목록(전체)을 가져온다.",
+     "parameters": {"type": "object", "properties": {"tab": {"type": "string"}, "page": {"type": "integer"}, "size": {"type": "integer"}}, "required": []}},
+    {"type": "function", "name": "get_latest_courses",
+     "description": "🆕 신규 강의 목록(전체)을 가져온다.",
+     "parameters": {"type": "object", "properties": {"tab": {"type": "string"}, "page": {"type": "integer"}, "size": {"type": "integer"}}, "required": []}},
+    {"type": "function", "name": "get_popular_courses_by_category",
+     "description": "🔥 인기 강의(카테고리)를 가져온다.",
+     "parameters": {"type": "object", "properties": {"categoryId": {"type": "integer"}, "tab": {"type": "string"}, "page": {"type": "integer"}, "size": {"type": "integer"}}, "required": ["categoryId"]}},
+    {"type": "function", "name": "get_latest_courses_by_category",
+     "description": "🆕 신규 강의(카테고리)를 가져온다.",
+     "parameters": {"type": "object", "properties": {"categoryId": {"type": "integer"}, "tab": {"type": "string"}, "page": {"type": "integer"}, "size": {"type": "integer"}}, "required": ["categoryId"]}},
+    {"type": "function", "name": "search_courses",
+     "description": "🔎 검색어로 강의를 검색한다. (#번호/몇번 표기는 검색 힌트로 처리한다)",
+     "parameters": {"type": "object", "properties": {"keyword": {"type": "string"}, "page": {"type": "integer"}, "size": {"type": "integer"}}, "required": ["keyword"]}},
+    {"type": "function", "name": "get_next_page",
+     "description": "더보기/다음: 직전 요청이 검색이면 검색 다음 페이지, 아니면 목록 다음 페이지를 가져온다.",
+     "parameters": {"type": "object", "properties": {}, "required": []}},
+    {"type": "function", "name": "debug_popular_raw",
+     "description": "디버그: 인기 강의 API 원본 JSON(정규화 포함)을 그대로 반환한다.",
+     "parameters": {"type": "object", "properties": {"page": {"type": "integer"}, "size": {"type": "integer"}}, "required": []}},
 ]
 
 # =====================================================
@@ -339,13 +382,12 @@ def llm_request(messages: List[dict]):
         tools=TOOLS,
     )
 
-def run_agent_turn(session_id: str, user_text: str) -> str:
+def run_agent_turn(session_id: str, user_text: str) -> Tuple[str, Optional[List[dict]]]:
     messages = get_or_create_messages(session_id)
     state = get_session_state(session_id)
 
-    last_items = None
+    last_items: Optional[List[dict]] = None
 
-    # add user
     messages.append({
         "type": "message",
         "role": "user",
@@ -372,7 +414,6 @@ def run_agent_turn(session_id: str, user_text: str) -> str:
             except json.JSONDecodeError:
                 args = {}
 
-            # tool exec
             if name == "get_next_page":
                 last = state.get("last_query")
                 if not last:
@@ -391,11 +432,9 @@ def run_agent_turn(session_id: str, user_text: str) -> str:
                 else:
                     result = fn(**args)
 
-                    # ✅ tool 결과에 items가 있으면 저장(카드용)
                     if isinstance(result, dict) and isinstance(result.get("items"), list):
-                        last_items = result["items"]
+                        last_items = result.get("items", [])
 
-                # update last_query for pagination
                 if name in ("get_popular_courses", "get_latest_courses", "get_popular_courses_by_category", "get_latest_courses_by_category"):
                     state["last_query"] = {
                         "mode": "list",
@@ -411,6 +450,8 @@ def run_agent_turn(session_id: str, user_text: str) -> str:
                         "keyword": args.get("keyword"),
                         "page": args.get("page", 0),
                         "size": args.get("size", 12),
+                        "hintNo": (result.get("hintNo") if isinstance(result, dict) else None),
+                        "cleanedKeyword": (result.get("cleanedKeyword") if isinstance(result, dict) else None),
                     }
 
             messages.append({
@@ -434,7 +475,6 @@ class ChatRequest(BaseModel):
     sessionId: Optional[str] = Field(None)
     message: str
     userId: Optional[str] = None
-
     class Config:
         extra = "ignore"
 
@@ -467,14 +507,22 @@ def health():
 def chat(req: ChatRequest):
     session_id = req.sessionId
     if not session_id:
-        # 유니크한 세션 ID 생성 (원하는 포맷으로 변경 가능)
         session_id = f"s_{int(time.time()*1000)}_{uuid.uuid4().hex[:8]}"
 
     reply, items = run_agent_turn(session_id, req.message)
 
-    # ✅ 강의 목록이 있는 턴이면 reply를 짧게(줄글 방지)
+    # =====================================================
+    # ✅ UX FIX (중복 방지)
+    # - items(카드)가 있으면: reply는 무조건 짧은 템플릿으로 강제
+    # - items가 없으면: 장문일 수 있으니 개행만 보정
+    # =====================================================
     if items:
-        reply = "📚 강의 목록을 가져왔어요. 아래 카드에서 확인해 보세요!"
+        if len(items) == 1:
+            reply = "요청하신 강의예요 👇 아래 카드에서 확인해 보세요."
+        else:
+            reply = f"관련 강의 {len(items)}개를 찾았어요 👇 아래 카드에서 골라보세요."
+    else:
+        reply = prettify_multiline_reply(reply)
 
     return ChatResponse(sessionId=session_id, reply=reply, items=items)
 
