@@ -2,13 +2,16 @@ import os
 import json
 import difflib
 import threading
-from typing import Any, Dict, List, Optional
+from typing import Optional, Dict, List, Any
 
 import requests
 import openai
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
+
+import time
+import uuid
 
 # =====================================================
 # ENV
@@ -340,6 +343,8 @@ def run_agent_turn(session_id: str, user_text: str) -> str:
     messages = get_or_create_messages(session_id)
     state = get_session_state(session_id)
 
+    last_items = None
+
     # add user
     messages.append({
         "type": "message",
@@ -355,7 +360,7 @@ def run_agent_turn(session_id: str, user_text: str) -> str:
         if not calls:
             final_text = sanitize_text(response.output_text or "")
             save_messages(session_id, messages)
-            return final_text or "(empty)"
+            return final_text or "(empty)", last_items
 
         for call in calls:
             name = _get_name(call)
@@ -385,6 +390,10 @@ def run_agent_turn(session_id: str, user_text: str) -> str:
                     result = {"error": f"Unknown function: {name}"}
                 else:
                     result = fn(**args)
+
+                    # ✅ tool 결과에 items가 있으면 저장(카드용)
+                    if isinstance(result, dict) and isinstance(result.get("items"), list):
+                        last_items = result["items"]
 
                 # update last_query for pagination
                 if name in ("get_popular_courses", "get_latest_courses", "get_popular_courses_by_category", "get_latest_courses_by_category"):
@@ -416,18 +425,30 @@ def run_agent_turn(session_id: str, user_text: str) -> str:
         if response.output_text and response.output_text.strip():
             final_text = sanitize_text(response.output_text)
             save_messages(session_id, messages)
-            return final_text
+            return final_text, last_items
 
 # =====================================================
 # API Schemas
 # =====================================================
 class ChatRequest(BaseModel):
-    sessionId: str = Field(..., description="대화 세션 ID")
-    message: str = Field(..., description="사용자 메시지")
+    sessionId: Optional[str] = Field(None)
+    message: str
+    userId: Optional[str] = None
+
+    class Config:
+        extra = "ignore"
+
+class CourseItem(BaseModel):
+    courseId: Optional[int] = None
+    title: str = ""
+    description: str = ""
+    price: int = 0
+    detailUrl: str = ""
 
 class ChatResponse(BaseModel):
     sessionId: str
     reply: str
+    items: Optional[List[CourseItem]] = None
 
 # =====================================================
 # Endpoints
@@ -444,8 +465,18 @@ def health():
 
 @app.post("/api/chat", response_model=ChatResponse)
 def chat(req: ChatRequest):
-    reply = run_agent_turn(req.sessionId, req.message)
-    return ChatResponse(sessionId=req.sessionId, reply=reply)
+    session_id = req.sessionId
+    if not session_id:
+        # 유니크한 세션 ID 생성 (원하는 포맷으로 변경 가능)
+        session_id = f"s_{int(time.time()*1000)}_{uuid.uuid4().hex[:8]}"
+
+    reply, items = run_agent_turn(session_id, req.message)
+
+    # ✅ 강의 목록이 있는 턴이면 reply를 짧게(줄글 방지)
+    if items:
+        reply = "📚 강의 목록을 가져왔어요. 아래 카드에서 확인해 보세요!"
+
+    return ChatResponse(sessionId=session_id, reply=reply, items=items)
 
 @app.post("/api/session/reset")
 def reset_session(payload: dict):
